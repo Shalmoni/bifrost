@@ -14,6 +14,16 @@ interface OAuth2AuthorizerProps {
 	onConflict?: (error: string) => void;
 	authorizeUrl: string;
 	oauthConfigId: string;
+	// Flow row behind a reauthorize consent (from POST /reauthorize). Status
+	// polls send it so the server answers from the flow's own state: the
+	// config's bootstrap status has been "authorized" since the client was
+	// first verified and never regresses, so polling it alone reads
+	// "authorized" on the first tick, before the admin has signed in.
+	flowId?: string;
+	// The flow's deadline (from the same response). Polling stops with a
+	// timeout once it passes instead of waiting on a flow row that the
+	// server may already have swept.
+	expiresAt?: string;
 	mcpClientId: string;
 	isPerUserOauth?: boolean;
 	// A popup the caller already opened synchronously (before any await), to
@@ -48,6 +58,8 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 	onConflict,
 	authorizeUrl,
 	oauthConfigId,
+	flowId,
+	expiresAt,
 	isPerUserOauth,
 	initialPopup,
 	isReauthorize,
@@ -122,10 +134,20 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 		[stopPolling, onError],
 	);
 
+	const isPastDeadline = useCallback(() => {
+		if (!expiresAt) return false;
+		const deadline = Date.parse(expiresAt);
+		return !Number.isNaN(deadline) && Date.now() > deadline;
+	}, [expiresAt]);
+
 	const checkOAuthStatus = useCallback(async () => {
 		if (cancelledRef.current) return;
+		if (isPastDeadline()) {
+			handleOAuthFailed("Authorization timed out before the provider redirected back. Retry to start a new flow.");
+			return;
+		}
 		try {
-			const result = await getOAuthStatus(oauthConfigId).unwrap();
+			const result = await getOAuthStatus({ oauthConfigId, flowId }).unwrap();
 			if (cancelledRef.current) return;
 			if (result.status === "authorized") {
 				stopPolling();
@@ -136,14 +158,18 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 		} catch (error) {
 			console.error("Error checking OAuth status:", error);
 		}
-	}, [oauthConfigId, getOAuthStatus, stopPolling, handleOAuthComplete, handleOAuthFailed]);
+	}, [oauthConfigId, flowId, getOAuthStatus, stopPolling, handleOAuthComplete, handleOAuthFailed, isPastDeadline]);
 
 	const startPolling = useCallback(() => {
 		if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
 		pollIntervalRef.current = setInterval(async () => {
 			if (popupRef.current && popupRef.current.closed) {
+				if (isPastDeadline()) {
+					handleOAuthFailed("Authorization timed out before the provider redirected back. Retry to start a new flow.");
+					return;
+				}
 				try {
-					const result = await getOAuthStatus(oauthConfigId).unwrap();
+					const result = await getOAuthStatus({ oauthConfigId, flowId }).unwrap();
 					if (result.status === "authorized") {
 						stopPolling();
 						await handleOAuthComplete();
@@ -158,7 +184,7 @@ export const OAuth2Authorizer: React.FC<OAuth2AuthorizerProps> = ({
 			}
 			await checkOAuthStatus();
 		}, 2000);
-	}, [checkOAuthStatus, getOAuthStatus, handleOAuthComplete, handleOAuthFailed, oauthConfigId, stopPolling]);
+	}, [checkOAuthStatus, getOAuthStatus, handleOAuthComplete, handleOAuthFailed, isPastDeadline, oauthConfigId, flowId, stopPolling]);
 
 	const openPopup = useCallback(() => {
 		isCompletingRef.current = false;
